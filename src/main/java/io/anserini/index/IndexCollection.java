@@ -29,10 +29,14 @@ import org.apache.lucene.document.Document;
 import org.apache.lucene.index.ConcurrentMergeScheduler;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.IndexableField;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.similarities.BM25Similarity;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FSDirectory;
+import org.apache.solr.client.solrj.SolrClient;
+import org.apache.solr.client.solrj.impl.ConcurrentUpdateSolrClient;
+import org.apache.solr.common.SolrInputDocument;
 import org.kohsuke.args4j.*;
 
 import java.io.File;
@@ -89,7 +93,7 @@ public final class IndexCollection {
 
     @Option(name = "-keepStopwords", usage = "boolean switch to keep stopwords")
     public boolean keepStopwords = false;
-  
+
     @Option(name = "-stemmer", usage = "Stemmer: one of the following porter,krovetz,none. Default porter")
     public String stemmer = "porter";
 
@@ -120,6 +124,15 @@ public final class IndexCollection {
     @Option(name = "-tweet.deletedIdsFile", metaVar = "[Path]",
         usage = "a file that contains deleted tweetIds, one per line. these tweeets won't be indexed")
     public String tweetDeletedIdsFile = "";
+
+    @Option(name = "-solr", usage = "boolean switch to determine if we should index into Solr")
+    public boolean solr;
+
+    @Option(name = "solr.batchSize", usage = "the batch size for sumitting documents to Solr")
+    public int solrBatchSize;
+
+    @Option(name = "-solr.url", metaVar = "[solr.url]", usage = "the URL of the index on Solr (comma separated list if cloud mode)")
+    public String solrUrl;
   }
 
   public final class Counters {
@@ -216,7 +229,28 @@ public final class IndexCollection {
           } else {
             writer.addDocument(doc);
           }
+
+          if (args.solr) {
+
+            SolrInputDocument solrDoc = new SolrInputDocument();
+
+            // Index each STORED field in Solr
+            for (IndexableField field : doc.getFields()) {
+              if (field.fieldType().stored()) {
+                solrDoc.addField(field.name(), field.stringValue());
+              }
+            }
+
+            solrClient.add(solrDoc);
+
+          }
+
           cnt++;
+        }
+
+        // Commit the Solr changes
+        if (args.solr) {
+          solrClient.commit();
         }
 
         if (iter.getNextRecordStatus() == BaseFileSegment.Status.ERROR) {
@@ -241,6 +275,7 @@ public final class IndexCollection {
   private final Class generatorClass;
   private final DocumentCollection collection;
   private final Counters counters;
+  private final SolrClient solrClient;
 
   public IndexCollection(IndexCollection.Args args) throws Exception {
     this.args = args;
@@ -256,6 +291,9 @@ public final class IndexCollection {
     LOG.info("Store docvectors? " + args.storeDocvectors);
     LOG.info("Store transformed docs? " + args.storeTransformedDocs);
     LOG.info("Store raw docs? " + args.storeRawDocs);
+    LOG.info("Solr? " + args.solr);
+    LOG.info("Solr URL: " + args.solrUrl);
+    LOG.info("Solr batch size: " + args.solrBatchSize);
     LOG.info("Optimize (merge segments)? " + args.optimize);
     LOG.info("Whitelist: " + args.whitelist);
 
@@ -284,6 +322,7 @@ public final class IndexCollection {
     }
 
     this.counters = new Counters();
+    this.solrClient = args.solr ? new ConcurrentUpdateSolrClient.Builder(args.solrUrl).withQueueSize(args.solrBatchSize).build() : null;
   }
 
   public void run() throws IOException, InterruptedException {
@@ -291,11 +330,11 @@ public final class IndexCollection {
     LOG.info("Starting indexer...");
 
     int numThreads = args.threads;
-    
+
     final Directory dir = FSDirectory.open(indexPath);
     final EnglishStemmingAnalyzer analyzer = args.keepStopwords ?
         new EnglishStemmingAnalyzer(args.stemmer, CharArraySet.EMPTY_SET) : new EnglishStemmingAnalyzer(args.stemmer);
-    
+
     final TweetAnalyzer tweetAnalyzer = new TweetAnalyzer(args.tweetStemming);
     final IndexWriterConfig config = args.collectionClass.equals("TweetCollection") ?
         new IndexWriterConfig(tweetAnalyzer) : new IndexWriterConfig(analyzer);
