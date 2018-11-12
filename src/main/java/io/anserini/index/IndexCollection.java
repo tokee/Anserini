@@ -126,13 +126,16 @@ public final class IndexCollection {
     public String tweetDeletedIdsFile = "";
 
     @Option(name = "-solr", usage = "boolean switch to determine if we should index into Solr")
-    public boolean solr;
+    public boolean solr = false;
 
     @Option(name = "solr.batchSize", usage = "the batch size for sumitting documents to Solr")
-    public int solrBatchSize;
+    public int solrBatchSize = 1000;
 
     @Option(name = "-solr.url", metaVar = "[solr.url]", usage = "the URL of the index on Solr (comma separated list if cloud mode)")
     public String solrUrl;
+
+    @Option(name = "-mod", usage = "keep documents of form: doc.id() = [mod] (mod 5)")
+    public int mod = -1;
   }
 
   public final class Counters {
@@ -204,6 +207,11 @@ public final class IndexCollection {
           try {
             d = iter.next();
           } catch (RuntimeException e) {
+            counters.skipped.incrementAndGet();
+            continue;
+          }
+
+          if (args.mod >= 0 && Long.parseLong(d.id()) % 5 != args.mod) {
             counters.skipped.incrementAndGet();
             continue;
           }
