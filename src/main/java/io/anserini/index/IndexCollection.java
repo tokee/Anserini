@@ -57,6 +57,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 public final class IndexCollection {
   private static final Logger LOG = LogManager.getLogger(IndexCollection.class);
+  private List<Instrumentation> instrumentations = new ArrayList<>();
 
   public static final class Args {
 
@@ -187,6 +188,7 @@ public final class IndexCollection {
     public AtomicLong errors = new AtomicLong();
   }
 
+  private final Instrumentation iLuceneDelivery = new Instrumentation("Lucene delivery");
   private final class LocalIndexerThread extends Thread {
     final private Path inputFile;
     final private IndexWriter writer;
@@ -228,9 +230,12 @@ public final class IndexCollection {
             continue;
           }
 
+          final long docCreationStartNS = System.nanoTime();
           // Yes, we know what we're doing here.
           @SuppressWarnings("unchecked")
           Document doc = generator.createDocument(d);
+          iGeneration.beatSince(docCreationStartNS);
+
           if (doc == null) {
             counters.unindexed.incrementAndGet();
             continue;
@@ -240,11 +245,13 @@ public final class IndexCollection {
             continue;
           }
 
+          final long startDeliveryNS = System.nanoTime();
           if (args.uniqueDocid) {
             writer.updateDocument(new Term("id", d.id()), doc);
           } else {
             writer.addDocument(doc);
           }
+          iLuceneDelivery.beatSince(startDeliveryNS);
           cnt++;
         }
 
@@ -261,6 +268,10 @@ public final class IndexCollection {
       }
     }
   }
+
+  private final Instrumentation iGeneration = new Instrumentation("Base generation");
+  private final Instrumentation iSolrConversion = new Instrumentation("Lucene->Solr conversion");
+  private final Instrumentation iSolrDelivery = new Instrumentation("Solr delivery");
 
   private final class SolrIndexerThread implements Runnable {
 
@@ -297,7 +308,10 @@ public final class IndexCollection {
             continue;
           }
 
+          final long docCreationStartNS = System.nanoTime();
           Document document = generator.createDocument(sourceDocument);
+          iGeneration.beatSince(docCreationStartNS);
+
           if (document == null) {
             counters.unindexed.incrementAndGet();
             continue;
@@ -307,6 +321,7 @@ public final class IndexCollection {
             continue;
           }
 
+          final long startSolrConversionNS = System.nanoTime();
           SolrInputDocument solrDocument = new SolrInputDocument();
 
           // Copy all Lucene Document fields to Solr document
@@ -315,7 +330,9 @@ public final class IndexCollection {
               solrDocument.addField(field.name(), field.stringValue());
             }
           }
+          iSolrConversion.beatSince(startSolrConversionNS);
 
+          final long startDelivery = System.nanoTime();
           // With CloudSolrClient, we need to buffer ourselves...
           if (args.solrCloud) {
             buffer.add(solrDocument);
@@ -325,6 +342,7 @@ public final class IndexCollection {
           } else {
             client.add(args.solrIndex, solrDocument, args.solrCommitWithin * 1000); // ... and ConcurrentUpdateSolrClient does it for us
           }
+          iSolrDelivery.beatSince(startDelivery);
 
           cnt++;
         }
@@ -362,6 +380,54 @@ public final class IndexCollection {
 
   }
 
+  private String getStats() {
+    StringBuilder sb = new StringBuilder();
+    synchronized (IndexCollection.class) {
+      for (Instrumentation ins: instrumentations) {
+        if (sb.length() > 0) {
+          sb.append(", ");
+        }
+        sb.append(ins.toString());
+      }
+    }
+
+    Runtime rt = Runtime.getRuntime();
+    sb.append(String.format(" Mem: max=%dMB, allocated=%dMB, free=%dMB",
+                            rt.maxMemory()/1048576, rt.totalMemory()/1048576, rt.freeMemory()/1048576));
+    return sb.toString();
+  }
+  private class Instrumentation {
+    private final AtomicLong count = new AtomicLong(0);
+    private final AtomicLong ns = new AtomicLong(0);
+    private final String designation;
+
+    public Instrumentation(String designation) {
+      this.designation = designation;
+      synchronized (IndexCollection.class) {
+        instrumentations.add(this);
+      }
+    }
+
+    public void beatSince(long ns) {
+      beatSince(1, ns);
+    }
+    public void beatSince(long invocations, long ns) {
+      beat(invocations, System.nanoTime()-ns);
+    }
+    public void beat(long ns) {
+      beat(1, ns);
+    }
+    public void beat(long invocations, long ns) {
+      count.addAndGet(invocations);
+      this.ns.addAndGet(ns);
+    }
+
+    public String toString() {
+      double s = 1.0*ns.get()/1000000/1000/60;
+      return String.format("%s: [invocations: %d, time spend: %d seconds, average: %.1f invocations/s]",
+                           designation, count.get(), (long)s, count.get()/s);
+    }
+  }
   private final IndexCollection.Args args;
   private final Path collectionPath;
   private final Set whitelistDocids;
@@ -436,24 +502,31 @@ public final class IndexCollection {
     this.counters = new Counters();
   }
 
+  private final Instrumentation iClientCreation = new Instrumentation("SolrClient creation");
+  private final Instrumentation iClientDestruction = new Instrumentation("SolrClient destruction");
   private class SolrClientFactory extends BasePooledObjectFactory<SolrClient> {
 
     @Override
     public SolrClient create() throws Exception {
       // SolrCloud
-      if (args.solrCloud) {
-        List<String> urls = Splitter.on(',').splitToList(args.solrUrl);
-        if (StringUtils.isNotEmpty(args.solrZkChroot)) {
-          return new CloudSolrClient.Builder(urls, Optional.of(args.solrZkChroot)).build(); // Connect to ZooKeeper
-        } else {
-          return new CloudSolrClient.Builder(urls).build(); // Connect to list of Solr servers
+      final long startCreation = System.nanoTime();
+      try {
+        if (args.solrCloud) {
+          List<String> urls = Splitter.on(',').splitToList(args.solrUrl);
+          if (StringUtils.isNotEmpty(args.solrZkChroot)) {
+            return new CloudSolrClient.Builder(urls, Optional.of(args.solrZkChroot)).build(); // Connect to ZooKeeper
+          } else {
+            return new CloudSolrClient.Builder(urls).build(); // Connect to list of Solr servers
+          }
         }
+        // Standlone
+        return new ConcurrentUpdateSolrClient.Builder(args.solrUrl)
+                .withQueueSize(args.solrBatch)
+                .withThreadCount(args.threads)
+                .build();
+      } finally {
+        iClientCreation.beatSince(startCreation);
       }
-      // Standlone
-      return new ConcurrentUpdateSolrClient.Builder(args.solrUrl)
-          .withQueueSize(args.solrBatch)
-          .withThreadCount(args.threads)
-          .build();
     }
 
     @Override
@@ -463,7 +536,9 @@ public final class IndexCollection {
 
     @Override
     public void destroyObject(PooledObject<SolrClient> pooled) throws Exception {
+      final long startDestruction = System.nanoTime();
       pooled.getObject().close();
+      iClientDestruction.beatSince(startDestruction);
     }
 
   }
@@ -581,6 +656,7 @@ public final class IndexCollection {
     final long durationMillis = TimeUnit.MILLISECONDS.convert(System.nanoTime() - start, TimeUnit.NANOSECONDS);
     LOG.info(String.format("Total %,d documents indexed in %s", numIndexed,
         DurationFormatUtils.formatDuration(durationMillis, "HH:mm:ss")));
+    LOG.info("Performance statistics: " + getStats());
   }
 
   public static void main(String[] args) throws Exception {
