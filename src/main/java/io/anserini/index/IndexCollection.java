@@ -16,20 +16,15 @@
 
 package io.anserini.index;
 
+import com.google.common.base.Charsets;
 import com.google.common.base.Splitter;
+import com.google.common.hash.Hashing;
 import io.anserini.analysis.EnglishStemmingAnalyzer;
 import io.anserini.analysis.TweetAnalyzer;
 import io.anserini.collection.*;
 import io.anserini.index.generator.LuceneDocumentGenerator;
 import org.apache.commons.io.FileUtils;
-import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.time.DurationFormatUtils;
-import org.apache.commons.pool2.BasePooledObjectFactory;
-import org.apache.commons.pool2.ObjectPool;
-import org.apache.commons.pool2.PooledObject;
-import org.apache.commons.pool2.impl.DefaultPooledObject;
-import org.apache.commons.pool2.impl.GenericObjectPool;
-import org.apache.commons.pool2.impl.GenericObjectPoolConfig;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.analysis.CharArraySet;
@@ -147,8 +142,19 @@ public final class IndexCollection {
     @Option(name = "-solr.url", usage = "the URL of Solr (standalone) or ZooKeeper (cloud, possibly comma-separated) servers")
     public String solrUrl = null;
 
-    @Option(name = "-solr.zkChroot", usage = "the ZooKeeper chroot, if using a ZooKeeper URL instead of Solr")
-    public String solrZkChroot = null;
+    @Option(name = "-solr.zkChroot", usage = "the ZooKeeper chroot if using SolrCloud")
+    public String solrZkChroot = "/";
+
+    // Note: This is used for ConcurrentSolrClient, where each processing thread has its own instance
+    // If the architecture is changed to share one ConcurrentSolrClient among all threads, the default should likely be increased
+    @Option(name = "-solr.client.threads", metaVar = "[Number]", required = false, usage = "Number of Threads for each SolrClient")
+    public int solrClientThreads = 16;
+
+    @Option(name = "-shard.count", usage = "the number of shards for the index")
+    public int shardCount = -1;
+
+    @Option(name = "-shard.current", usage = "the current shard number to produce (indexed from 0)")
+    public int shardCurrent = -1;
   }
 
   public final class Counters {
@@ -230,9 +236,18 @@ public final class IndexCollection {
             continue;
           }
 
-          final long docCreationStartNS = System.nanoTime();
+          // Used for indexing distinct shardCount of a collection
+          if (args.shardCount > 1) {
+            int hash = Hashing.sha1().hashString(d.id(), Charsets.UTF_8).asInt() % args.shardCount;
+            if (hash != args.shardCurrent) {
+              counters.skipped.incrementAndGet();
+              continue;
+            }
+          }
+
           // Yes, we know what we're doing here.
           @SuppressWarnings("unchecked")
+          final long docCreationStartNS = System.nanoTime();
           Document doc = generator.createDocument(d);
           iGeneration.beatSince(docCreationStartNS);
 
@@ -291,8 +306,6 @@ public final class IndexCollection {
         LuceneDocumentGenerator generator = (LuceneDocumentGenerator) generatorClass.getDeclaredConstructor(Args.class, Counters.class).newInstance(args, counters);
         BaseFileSegment<SourceDocument> iter = (BaseFileSegment) ((SegmentProvider) collection).createFileSegment(input);
 
-        SolrClient client = solrPool.borrowObject();
-
         int cnt = 0;
         while (iter.hasNext()) {
           SourceDocument sourceDocument;
@@ -306,6 +319,15 @@ public final class IndexCollection {
           if (!sourceDocument.indexable()) {
             counters.unindexable.incrementAndGet();
             continue;
+          }
+
+          // Used for indexing distinct shardCount of a collection
+          if (args.shardCount > 1) {
+            int hash = Hashing.sha1().hashString(sourceDocument.id(), Charsets.UTF_8).asInt() % args.shardCount;
+            if (hash != args.shardCurrent) {
+              counters.skipped.incrementAndGet();
+              continue;
+            }
           }
 
           final long docCreationStartNS = System.nanoTime();
@@ -337,10 +359,10 @@ public final class IndexCollection {
           if (args.solrCloud) {
             buffer.add(solrDocument);
             if (buffer.size() == args.solrBatch) {
-              flush(client);
+              flush();
             }
           } else {
-            client.add(args.solrIndex, solrDocument, args.solrCommitWithin * 1000); // ... and ConcurrentUpdateSolrClient does it for us
+            solrClient.add(args.solrIndex, solrDocument, args.solrCommitWithin * 1000); // ... and ConcurrentUpdateSolrClient does it for us
           }
           iSolrDelivery.beatSince(startDelivery);
 
@@ -349,14 +371,12 @@ public final class IndexCollection {
 
         // If we're running in cloud mode and have docs in the buffer, flush them.
         if (args.solrCloud && !buffer.isEmpty()) {
-          flush(client);
+          flush();
         }
 
         if (iter.getNextRecordStatus() == BaseFileSegment.Status.ERROR) {
           counters.errors.incrementAndGet();
         }
-
-        solrPool.returnObject(client);
 
         iter.close();
         LOG.info(input.getParent().getFileName().toString() + File.separator + input.getFileName().toString() + ": " + cnt + " docs added.");
@@ -367,10 +387,10 @@ public final class IndexCollection {
 
     }
 
-    private void flush(SolrClient client) {
+    private void flush() {
       if (!buffer.isEmpty()) {
         try {
-          client.add(args.solrIndex, buffer, args.solrCommitWithin * 1000);
+          solrClient.add(args.solrIndex, buffer, args.solrCommitWithin * 1000);
           buffer.clear();
         } catch (Exception e) {
           LOG.error("Error flushing documents to Solr", e);
@@ -436,7 +456,7 @@ public final class IndexCollection {
   private final DocumentCollection collection;
   private final Counters counters;
   private Path indexPath;
-  private ObjectPool<SolrClient> solrPool;
+  private SolrClient solrClient;
 
   public IndexCollection(IndexCollection.Args args) throws Exception {
     this.args = args;
@@ -461,6 +481,7 @@ public final class IndexCollection {
       LOG.info("Solr commitWithin: " + args.solrCommitWithin);
       LOG.info("Solr index: " + args.solrIndex);
       LOG.info("Solr URL: " + args.solrUrl);
+      LOG.info("SolrClient Threads: " + args.solrClientThreads);
     }
 
     if (args.index == null && !args.solr) {
@@ -492,58 +513,33 @@ public final class IndexCollection {
       this.whitelistDocids = null;
     }
 
-      if (args.solr) {
-        GenericObjectPoolConfig<SolrClient> config = new GenericObjectPoolConfig<>();
-        config.setMaxTotal(args.threads);
-        config.setMinIdle(args.threads); // To guard against premature discarding of solrClients
-        this.solrPool = new GenericObjectPool<>(new SolrClientFactory(), config);
+    if (args.solr) {
+      if (args.solrCloud) {
+        List<String> urls = Splitter.on(',').splitToList(args.solrUrl);
+        this.solrClient = new CloudSolrClient.Builder(urls, Optional.of(args.solrZkChroot)).build();
+      } else {
+        ConcurrentUpdateSolrClient.Builder builder = new ConcurrentUpdateSolrClient.Builder(args.solrUrl)
+          .withQueueSize(args.solrBatch)
+          .withThreadCount(args.solrClientThreads);
+        this.solrClient = new ExceptionHandlingSolrClient(builder);
       }
+    }
 
     this.counters = new Counters();
   }
+  
+  private class ExceptionHandlingSolrClient extends ConcurrentUpdateSolrClient {
+      ExceptionHandlingSolrClient(ConcurrentUpdateSolrClient.Builder builder) {
+        super(builder);
+      }
 
-  private final Instrumentation iClientCreation = new Instrumentation("SolrClient creation");
-  private final Instrumentation iClientDestruction = new Instrumentation("SolrClient destruction");
-  private class SolrClientFactory extends BasePooledObjectFactory<SolrClient> {
-
-    @Override
-    public SolrClient create() throws Exception {
-      // SolrCloud
-      final long startCreation = System.nanoTime();
-      try {
-        if (args.solrCloud) {
-          List<String> urls = Splitter.on(',').splitToList(args.solrUrl);
-          if (StringUtils.isNotEmpty(args.solrZkChroot)) {
-            return new CloudSolrClient.Builder(urls, Optional.of(args.solrZkChroot)).build(); // Connect to ZooKeeper
-          } else {
-            return new CloudSolrClient.Builder(urls).build(); // Connect to list of Solr servers
-          }
-        }
-        // Standlone
-        return new ConcurrentUpdateSolrClient.Builder(args.solrUrl)
-                .withQueueSize(args.solrBatch)
-                .withThreadCount(args.threads)
-                .build();
-      } finally {
-        iClientCreation.beatSince(startCreation);
+      @Override
+      public void handleError(Throwable ex) {
+        LOG.warn("Solr: Exception delivering documents", ex);
       }
     }
 
-    @Override
-    public PooledObject<SolrClient> wrap(SolrClient solrClient) {
-      return new DefaultPooledObject(solrClient);
-    }
-
-    @Override
-    public void destroyObject(PooledObject<SolrClient> pooled) throws Exception {
-      final long startDestruction = System.nanoTime();
-      pooled.getObject().close();
-      iClientDestruction.beatSince(startDestruction);
-    }
-
-  }
-
-  public void run() throws IOException, InterruptedException {
+  public void run() throws IOException {
     final long start = System.nanoTime();
     LOG.info("Starting indexer...");
 
@@ -612,11 +608,8 @@ public final class IndexCollection {
     // Do a final commit
     if (args.solr) {
       try {
-        SolrClient client = solrPool.borrowObject();
-        client.commit(args.solrIndex);
-        // Needed for orderly shutdown so the SolrClient executor does not delay main thread exit
-        solrPool.returnObject(client);
-        solrPool.close();
+        solrClient.commit(args.solrIndex);
+        solrClient.close();
       } catch (Exception e) {
         LOG.error("Exception during final Solr commit: ", e);
       }
