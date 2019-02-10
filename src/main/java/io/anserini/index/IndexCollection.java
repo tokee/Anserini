@@ -338,21 +338,16 @@ public final class IndexCollection {
             }
           }
 
-          // With CloudSolrClient, we need to buffer ourselves...
-          if (args.solrCloud) {
+          // Buffer is always needed
             buffer.add(solrDocument);
             if (buffer.size() == args.solrBatch) {
-              flush();
+                flush();
             }
-          } else {
-            solrClient.add(args.solrIndex, solrDocument, args.solrCommitWithin * 1000); // ... and ConcurrentUpdateSolrClient does it for us
-          }
 
           cnt++;
         }
 
-        // If we're running in cloud mode and have docs in the buffer, flush them.
-        if (args.solrCloud && !buffer.isEmpty()) {
+        if (!buffer.isEmpty()) {
           flush();
         }
 
@@ -453,7 +448,7 @@ public final class IndexCollection {
         this.solrClient = new CloudSolrClient.Builder(urls, Optional.of(args.solrZkChroot)).build();
       } else {
         ConcurrentUpdateSolrClient.Builder builder = new ConcurrentUpdateSolrClient.Builder(args.solrUrl)
-          .withQueueSize(args.solrBatch)
+          .withQueueSize(args.threads*2)
           .withThreadCount(args.solrClientThreads);
         this.solrClient = new ExceptionHandlingSolrClient(builder);
       }
